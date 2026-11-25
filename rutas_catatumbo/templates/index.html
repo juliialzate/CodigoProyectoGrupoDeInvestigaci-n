@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Centro de ayuda inmediata a personas víctimas de desplazamiento forzado</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  body { margin:0; font-family: system-ui, sans-serif; display:flex; height:100vh; }
+  #panel { width:340px; padding:14px; overflow:auto; background:#f5f5f5; box-sizing:border-box; font-size:14px; }
+  #map { flex:1; }
+  h3 { margin:0 0 8px; line-height:1.25; }
+  button { width:100%; padding:8px; margin:3px 0; font-size:14px; cursor:pointer; }
+  #resultado { background:#fff; padding:10px; border-radius:6px; margin-top:10px; line-height:1.5; }
+  .ic { width:30px; height:30px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+        font-size:16px; border:2px solid #fff; box-shadow:0 1px 4px rgba(0,0,0,.5); }
+  .leyenda div { margin:4px 0; display:flex; align-items:center; gap:8px; }
+  .leyenda .ic { width:24px; height:24px; font-size:13px; flex:none; }
+  .popup button { background:#fff; border:1px solid #888; border-radius:6px; }
+  .popup button:hover { background:#ffe3f0; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h3>Centro de ayuda inmediata a personas víctimas de desplazamiento forzado</h3>
+  <p><b>1.</b> Haz clic en el mapa, en el punto donde necesitas que llegue alguien (dentro de Tibú, El Tarra o Teorama).<br>
+     <b>2.</b> Elige qué necesitas: ambulancia, patrulla o transporte de carga pesada.</p>
+  <button onclick="irA(8.6400,-72.7335)">Ir a Tibú</button>
+  <button onclick="irA(8.5765,-73.0875)">Ir a El Tarra</button>
+  <button onclick="irA(8.4350,-73.2880)">Ir a Teorama</button>
+  <button onclick="reiniciar()">Reiniciar</button>
+  <div id="resultado">Aún no hay solicitudes.</div>
+  <p id="prim"></p>
+  <div class="leyenda" id="leyenda"></div>
+  <p><span style="display:inline-block;width:26px;height:3px;background:#555"></span>
+     Grafo principal: conexiones entre nodos (tiempo en minutos).<br>
+     <span style="display:inline-block;width:26px;height:6px;background:#ff4fa3;border-radius:3px"></span>
+     Rutas de Prim: conectan todos los nodos en el menor tiempo.<br>
+     Aro amarillo = nodo estratégico (desde allí sale el transporte).<br>
+     Línea roja = llegada del transporte. Línea verde = traslado posterior.</p>
+</div>
+<div id="map"></div>
+
+<script>
+const ICONOS = {
+  desplazamiento: ['⚠️', '#222',    'Punto de desplazamiento'],
+  hospital:       ['🏥', '#d62728', 'Hospital'],
+  policia:        ['🚓', '#1f77b4', 'Estación de policía'],
+  alcaldia:       ['🏛️', '#8c564b', 'Alcaldía'],
+  centro_ayuda:   ['🏠', '#2ca02c', 'Centro de estadía y ayuda']
+};
+const TRANSPORTE = {ambulancia:'🚑 Ambulancia', policia:'🚓 Patrulla de policía', carga:'🚛 Transporte de carga pesada'};
+
+document.getElementById('leyenda').innerHTML = Object.values(ICONOS).map(i =>
+  `<div><span class="ic" style="background:${i[1]}">${i[0]}</span>${i[2]}</div>`).join('') +
+  '<div><span class="ic" style="background:#ff9900;width:12px;height:12px;border:1px solid #fff"></span>Poblado</div>';
+
+const map = L.map('map').setView([8.55, -73.0], 10);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution:'© OpenStreetMap'}).addTo(map);
+map.createPane('grafo'); map.getPane('grafo').style.zIndex = 405;
+map.createPane('prim');  map.getPane('prim').style.zIndex = 410;
+map.createPane('rutas'); map.getPane('rutas').style.zIndex = 430;
+map.createPane('nodos'); map.getPane('nodos').style.zIndex = 450;
+const capaBase = L.layerGroup().addTo(map);
+const capaRuta = L.layerGroup().addTo(map);
+let temporal = null;
+
+function irA(lat, lon) { map.setView([lat, lon], 15); }
+function icono(tipo) {
+  const i = ICONOS[tipo];
+  return L.divIcon({className:'', iconSize:[30,30], iconAnchor:[15,15],
+                    html:`<div class="ic" style="background:${i[1]}">${i[0]}</div>`});
+}
+
+async function cargar() {
+  const e = await (await fetch('/api/estado')).json();
+  capaBase.clearLayers();
+  // GRAFO PRINCIPAL: todas las aristas en gris; las del árbol de Prim, gruesas y rosadas
+  e.aristas.forEach(a => {
+    L.polyline(a.linea, {pane:'grafo', color:'#555', weight:2, opacity:.8}).addTo(capaBase)
+      .bindTooltip(a.min + ' min');
+    if (a.mst)
+      L.polyline(a.linea, {pane:'prim', color:'#ff4fa3', weight:7, opacity:.75}).addTo(capaBase)
+        .bindTooltip('Prim: ' + a.min + ' min');
+  });
+  const estrategicos = new Set([...e.estrategicos.hospital, ...e.estrategicos.policia, ...e.estrategicos.alcaldia]);
+  e.pois.forEach(p => {
+    const tip = '<b>' + p.nombre + '</b>' + (p.direccion ? '<br>' + p.direccion : '') +
+                (p.municipio ? '<br>' + p.municipio : '');
+    if (p.tipo === 'poblado') {
+      L.circleMarker([p.lat, p.lon], {pane:'nodos', radius:5, color:'#fff', weight:1, fillColor:'#ff9900', fillOpacity:1})
+        .addTo(capaBase).bindTooltip(tip);
+      return;
+    }
+    if (estrategicos.has(p.id))
+      L.circleMarker([p.lat, p.lon], {pane:'nodos', radius:19, color:'#f5c400', weight:4, fill:false}).addTo(capaBase);
+    L.marker([p.lat, p.lon], {icon:icono(p.tipo)}).addTo(capaBase).bindTooltip(tip);
+  });
+  document.getElementById('prim').innerHTML =
+    'Grafo principal: <b>' + e.pois.length + ' nodos</b>, <b>' + e.aristas.length + ' aristas</b>.<br>' +
+    'Prim (rosado): tiempo total que une todos los nodos = <b>' + e.total_min + ' min</b>.' +
+    (e.con_calles ? '' : '<br><small>⚠️ Sin calles de OpenStreetMap: aristas en línea recta.</small>');
+}
+
+// 1. el usuario hace clic -> 2. se le pregunta qué necesita
+map.on('click', ev => {
+  if (temporal) map.removeLayer(temporal);
+  temporal = L.marker(ev.latlng, {icon:L.divIcon({className:'', html:'<div style="font-size:28px">📍</div>', iconSize:[28,28], iconAnchor:[14,28]})}).addTo(map);
+  temporal.bindPopup(
+    '<div class="popup"><b>¿Qué necesitas en este punto?</b>' +
+    '<button onclick="pedir(\'ambulancia\')">🚑 Ambulancia</button>' +
+    '<button onclick="pedir(\'policia\')">🚓 Patrulla de policía</button>' +
+    '<button onclick="pedir(\'carga\')">🚛 Transporte de carga pesada</button></div>').openPopup();
+});
+
+async function pedir(tipo) {
+  const ll = temporal.getLatLng();
+  map.closePopup();
+  document.getElementById('resultado').textContent = 'Calculando la ruta más rápida...';
+  const r = await fetch('/api/emergencia', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({lat:ll.lat, lon:ll.lng, tipo})
+  });
+  let d;
+  try { d = await r.json(); } catch (_) { d = {error: 'Error del servidor. Revisa la terminal donde corre app.py.'}; }
+  map.removeLayer(temporal); temporal = null;
+  if (d.error) { document.getElementById('resultado').textContent = d.error; return; }
+
+  capaRuta.clearLayers();
+  L.polyline(d.ida,    {pane:'rutas', color:'#e00', weight:5}).addTo(capaRuta);
+  L.polyline(d.vuelta, {pane:'rutas', color:'#0a0', weight:5, dashArray:'2 8'}).addTo(capaRuta);
+
+  document.getElementById('resultado').innerHTML =
+    '<b>' + d.usuario.nombre + '</b><br>' + TRANSPORTE[d.tipo] + '<br><br>' +
+    'El transporte más rápido en llegar se encuentra en:<br><b>' + d.origen + '</b>' +
+    (d.origen_direccion ? '<br><small>' + d.origen_direccion + '</small>' : '') + '<br>' +
+    'Estará llegando a tu punto en <b>' + d.min_ida + ' min</b>.<br>' +
+    '<small>Recorrido por el grafo: ' + d.via.join(' → ') + '</small><hr>' +
+    'Destino posterior más rápido:<br><b>' + d.destino + '</b>' +
+    (d.destino_direccion ? '<br><small>' + d.destino_direccion + '</small>' : '') + '<br>' +
+    'Tiempo desde tu punto: <b>' + d.min_vuelta + ' min</b>' +
+    '<br><small>Tiempos estimados (30 km/h urbano), sin tráfico real.</small>';
+  cargar();   // 3. se recalcula y se redibuja Prim con el nuevo nodo
+}
+
+async function reiniciar() {
+  await fetch('/api/reiniciar', {method:'POST'});
+  capaRuta.clearLayers();
+  document.getElementById('resultado').textContent = 'Aún no hay solicitudes.';
+  cargar();
+}
+
+cargar();
+</script>
+</body>
+</html>
